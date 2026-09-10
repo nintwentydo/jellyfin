@@ -265,6 +265,7 @@ doc/
 
 # Deployment artifacts
 dist
+docker/server/
 *.exe
 *.dll
 

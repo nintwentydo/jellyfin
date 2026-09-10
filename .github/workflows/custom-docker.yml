@@ -1,0 +1,149 @@
+name: Custom Jellyfin Docker
+
+on:
+  push:
+    branches: [release/12-custom]
+    tags: ['v12.0.0-nintwentydo.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: custom-docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/nintwentydo/jellyfin
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Validate release ref
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REPOSITORY" != nintwentydo/jellyfin ]]; then
+            echo '::error::This workflow publishes the nintwentydo Jellyfin fork.'
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" =~ ^refs/tags/v12\.0\.0-nintwentydo\.[1-9][0-9]*$ ]]; then
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/heads/release/12-custom ]]; then
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo 'version=12.0.0-nintwentydo-dev' >> "$GITHUB_OUTPUT"
+          else
+            echo '::error::Push release/12-custom to validate or a v12.0.0-nintwentydo.N tag to publish.'
+            exit 1
+          fi
+
+  tests:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Run tests and Debug analyzers
+        run: dotnet test Jellyfin.sln --configuration Debug --verbosity minimal
+
+  image:
+    needs: [validate, tests]
+    name: Build and smoke test ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            rid: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            rid: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      IMAGE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+      - name: Publish complete native server
+        run: >
+          dotnet publish Jellyfin.Server/Jellyfin.Server.csproj
+          --configuration Release --runtime linux-${{ matrix.rid }}
+          --self-contained true --output docker/server
+          -p:DebugSymbols=false -p:DebugType=none
+      - name: Build native candidate
+        run: |
+          docker build --file docker/Dockerfile --tag "$IMAGE:$IMAGE_VERSION-$ARCH" \
+            --build-arg "IMAGE_VERSION=$IMAGE_VERSION" --build-arg "IMAGE_REVISION=$GITHUB_SHA" docker
+      - name: Verify native startup, payload and SQLite persistence
+        run: python3 docker/smoke-test.py "$IMAGE:$IMAGE_VERSION-$ARCH" "$ARCH"
+      - name: Push tested architecture image
+        if: needs.validate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          candidate="$IMAGE:$IMAGE_VERSION-$ARCH"
+          docker push "$candidate"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$candidate")
+          [[ "$digest" == "$IMAGE@"* ]]
+          [[ "${digest#*@}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$digest" > "$RUNNER_TEMP/digests/$ARCH.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish tested multiarch tags
+    needs: [validate, image]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: docker-digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Join immutable tested digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          images=()
+          for arch in amd64 arm64; do
+            digest=$(cat "$RUNNER_TEMP/digests/$arch.txt")
+            [[ "$digest" == "$IMAGE@"* ]]
+            [[ "${digest#*@}" =~ ^sha256:[0-9a-f]{64}$ ]]
+            images+=("$digest")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$IMAGE_VERSION" --tag "$IMAGE:sha-$GITHUB_SHA" "${images[@]}"
+          docker buildx imagetools inspect "$IMAGE:$IMAGE_VERSION"

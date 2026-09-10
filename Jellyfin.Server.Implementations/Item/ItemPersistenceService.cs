@@ -132,17 +132,17 @@ public class ItemPersistenceService : IItemPersistenceService
         context.Chapters.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
         context.CustomItemDisplayPreferences.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
         context.ItemDisplayPreferences.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
-        context.ItemValues.Where(e => e.BaseItemsMap!.Count == 0).ExecuteDelete();
         context.ItemValuesMap.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
         context.LinkedChildren.WhereOneOrMany(relatedItems, e => e.ParentId).ExecuteDelete();
         context.LinkedChildren.WhereOneOrMany(relatedItems, e => e.ChildId).ExecuteDelete();
+        var peopleIds = context.PeopleBaseItemMap.WhereOneOrMany(relatedItems, e => e.ItemId).Select(f => f.PeopleId).Distinct().ToArray();
         context.BaseItems.WhereOneOrMany(relatedItems, e => e.Id).ExecuteDelete();
+        context.ItemValues.Where(e => !e.BaseItemsMap!.Any()).ExecuteDelete();
         context.KeyframeData.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
         context.MediaSegments.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
         context.MediaStreamInfos.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
-        var query = context.PeopleBaseItemMap.WhereOneOrMany(relatedItems, e => e.ItemId).Select(f => f.PeopleId).Distinct().ToArray();
         context.PeopleBaseItemMap.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
-        context.Peoples.WhereOneOrMany(query, e => e.Id).Where(e => e.BaseItems!.Count == 0).ExecuteDelete();
+        context.Peoples.WhereOneOrMany(peopleIds, e => e.Id).Where(e => !e.BaseItems!.Any()).ExecuteDelete();
         context.TrickplayInfos.WhereOneOrMany(relatedItems, e => e.ItemId).ExecuteDelete();
         context.SaveChanges();
         transaction.Commit();
@@ -227,19 +227,22 @@ public class ItemPersistenceService : IItemPersistenceService
                 await dbContext.UserData
                     .Where(e => e.ItemId == BaseItemRepository.PlaceholderId)
                     .Where(e => userKeys.Contains(e.CustomDataKey))
+                    .Where(e => !dbContext.UserData.Any(current =>
+                        current.ItemId == item.Id && current.UserId == e.UserId && current.CustomDataKey == e.CustomDataKey))
                     .ExecuteUpdateAsync(
                         e => e
                             .SetProperty(f => f.ItemId, item.Id)
                             .SetProperty(f => f.RetentionDate, retentionDate),
                         cancellationToken).ConfigureAwait(false);
 
-                item.UserData = await dbContext.UserData
+                var userData = await dbContext.UserData
                     .AsNoTracking()
                     .Where(e => e.ItemId == item.Id)
                     .ToArrayAsync(cancellationToken)
                     .ConfigureAwait(false);
 
                 await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+                item.UserData = userData;
             }
         }
     }
